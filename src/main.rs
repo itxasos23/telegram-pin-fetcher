@@ -1,51 +1,47 @@
-//! Example to print the ID and title of all the dialogs.
-//!
-//! The `TG_ID` and `TG_HASH` environment variables must be set (learn how to do it for
-//! [Windows](https://ss64.com/nt/set.html) or [Linux](https://ss64.com/bash/export.html))
-//! to Telegram's API ID and API hash respectively.
-//!
-//! Then, run it as:
-//!
-//! ```sh
-//! cargo run --example dialogs
-//! ```
-
+use chrono;
 use grammers_client::{Client, Config, SignInError};
 use grammers_session::Session;
 use grammers_tl_types as tl;
+use home;
 use log;
-use simple_logger::SimpleLogger;
-use std::io::{self, BufRead as _, Write as _};
-use std::fs;
-use tokio::runtime;
 use serde_derive::{Deserialize, Serialize};
+use simple_logger::SimpleLogger;
+use std::fs;
+use std::io::{self, BufRead as _, Write as _};
+use std::path::PathBuf;
+use tokio::runtime;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-const SESSION_FILE: &str = "dialogs.session";
 
 #[derive(Deserialize)]
 struct FileConfig {
     telegram_api_creds: CredsConfig,
-    config: UsersConfig
+    config: UsersConfig,
+    upload: UploadConfig,
 }
 
 #[derive(Deserialize)]
 struct UsersConfig {
-    usernames: Vec<String>
+    usernames: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct CredsConfig {
     api_id: i32,
-    api_hash: String
+    api_hash: String,
+}
+
+#[derive(Deserialize)]
+struct UploadConfig {
+    provider: String,
+    api_token: String,
 }
 
 #[derive(Serialize, Debug)]
 struct Message {
     sender: String,
     text: String,
-    date: String 
+    date: String,
 }
 
 fn prompt(message: &str) -> Result<String> {
@@ -62,30 +58,55 @@ fn prompt(message: &str) -> Result<String> {
     Ok(line)
 }
 
-async fn async_main() -> Result<()> {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
+async fn get_pinned_messages(client: Client, creds_toml: &FileConfig) -> Result<Vec<Message>> {
+    let chat_names = &creds_toml.config.usernames;
+    let mut messages = Vec::<Message>::new();
 
-    let config_file_contents = fs::read_to_string("config.toml").unwrap();
-    let creds_toml: FileConfig = toml::from_str(&config_file_contents).unwrap();
+    for chat_name in chat_names {
+        let maybe_chat = client.resolve_username(chat_name.as_str()).await?;
+        let chat = maybe_chat.unwrap_or_else(|| panic!("Chat {} could not be found", chat_name));
+        let mut pinned_messages = client
+            .search_messages(&chat)
+            .filter(tl::enums::MessagesFilter::InputMessagesFilterPinned);
 
-    let api_id = creds_toml.telegram_api_creds.api_id;
-    let api_hash = creds_toml.telegram_api_creds.api_hash;
+        println!(
+            "Chat {} has {} total pinned messages.",
+            chat_name,
+            pinned_messages.total().await.unwrap()
+        );
 
-    println!("Connecting to Telegram...");
+        while let Some(msg) = pinned_messages.next().await? {
+            if let Some(_) = msg.media() {
+                continue;
+            }
+            let sender = msg.sender().unwrap();
+            let text = msg.text();
+            let date = msg.date().date_naive();
+
+            messages.push(Message {
+                sender: sender.username().unwrap().to_string(),
+                text: text.to_string(),
+                date: date.to_string(),
+            });
+        }
+    }
+
+    messages.sort_by(|a, b| a.date.cmp(&b.date));
+
+    Ok(messages)
+}
+
+async fn login_and_get_pinned_messages(
+    config: &FileConfig,
+    session_file: &PathBuf,
+) -> Result<Vec<Message>> {
     let client = Client::connect(Config {
-        session: Session::load_file_or_create(SESSION_FILE)?,
-        api_id,
-        api_hash: api_hash.clone(),
+        session: Session::load_file_or_create(&session_file).unwrap(),
+        api_id: config.telegram_api_creds.api_id.clone(),
+        api_hash: config.telegram_api_creds.api_hash.clone(),
         params: Default::default(),
     })
     .await?;
-    println!("Connected!");
-
-    // If we can't save the session, sign out once we're done.
-    let mut sign_out = false;
 
     if !client.is_authorized().await? {
         println!("Signing in...");
@@ -109,60 +130,85 @@ async fn async_main() -> Result<()> {
             Err(e) => panic!("{}", e),
         };
         println!("Signed in!");
-        match client.session().save_to_file(SESSION_FILE) {
-            Ok(_) => {}
-            Err(e) => {
-                println!(
-                    "NOTE: failed to save the session, will sign out when done: {}",
-                    e
-                );
-                sign_out = true;
-            }
-        }
     }
 
-    // while let Some(dialog) = dialogs.next().await? {let chat = dialog.chat(); println!("- {: >10} {}", chat.id(), chat.name());}
-    
-    let chat_names = creds_toml.config.usernames;
-    dbg!(&chat_names);
+    Ok(get_pinned_messages(client, config).await.unwrap())
+}
 
-    let mut messages = Vec::<Message>::new();
+fn get_config_dirs() -> (PathBuf, PathBuf) {
+    let mut config_dir = match home::home_dir() {
+        Some(path) => path,
+        None => panic!("Could not find home dir"),
+    };
 
-    for chat_name in chat_names {
+    config_dir.push(".config");
+    config_dir.push("telegram_pinned");
 
-        let maybe_chat = client.resolve_username(chat_name.as_str()).await?;
-        let chat = maybe_chat.unwrap_or_else(|| panic!("Chat {} could not be found", chat_name));
-        let mut pinned_messages = client.search_messages(&chat).filter(tl::enums::MessagesFilter::InputMessagesFilterPinned);
+    let mut config_file = config_dir.clone();
+    config_file.push("config.toml");
 
-        println!(
-            "Chat {} has {} total pinned messages.",
-            chat_name,
-            pinned_messages.total().await.unwrap()
-        );
+    let mut session_file = config_dir.clone();
+    session_file.push("telegram.session");
 
-        while let Some(msg) = pinned_messages.next().await? {
-            if let Some(_) = msg.media() {continue}
-            let sender = msg.sender().unwrap();
-            let text = msg.text();
-            let date = msg.date().date_naive();
+    (config_file, session_file)
+}
 
-            messages.push(Message {
-                sender: sender.username().unwrap().to_string(), 
-                text: text.to_string(), 
-                date: date.to_string()
-            });
+async fn async_main() -> Result<()> {
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
 
-        }
+    let (config_file_path, session_file_path) = get_config_dirs();
+
+    let config_file_contents = fs::read_to_string(&config_file_path).unwrap();
+    let creds_toml: FileConfig = toml::from_str(&config_file_contents).unwrap();
+
+    let messages = login_and_get_pinned_messages(&creds_toml, &session_file_path).await?;
+
+    match upload_messages(&creds_toml, messages).await {
+        Err(_) => println!("Error uploading messages"),
+        _ => (),
+    };
+
+    Ok(())
+}
+
+async fn upload_messages(creds_toml: &FileConfig, messages: Vec<Message>) -> Result<()> {
+    let payload = serde_json::to_string(&messages).unwrap().clone();
+
+    if creds_toml.upload.provider != "gofile" {
+        panic!("Only gofile upload provider is supported.");
     }
 
-    messages.sort_by(| a, b| a.date.cmp(&b.date));
+    let http_client = reqwest::Client::new();
+    let payload_bytes = String::from_utf8(payload.into_bytes()).unwrap();
+    let mut file_part_headers = reqwest::header::HeaderMap::new();
+    file_part_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        "application/json".parse().unwrap(),
+    );
 
-    let mut file = fs::File::create("out.json")?;
-    file.write_all(serde_json::to_string(&messages)?.as_bytes())?;
+    let now = chrono::offset::Utc::now();
+    let date = now.date_naive();
+    let filename = date.format("%Y-%m-%d.json").to_string();
 
-    if sign_out {
-        // TODO revisit examples and get rid of "handle references" (also, this panics)
-        drop(client.sign_out_disconnect().await);
+    let file_part = reqwest::multipart::Part::bytes(payload_bytes.into_bytes())
+        .file_name(filename)
+        .headers(file_part_headers);
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", file_part)
+        .text("folderId", "cf71f5f5-d849-4c80-94c7-eb73e5253c86");
+
+    let req = http_client
+        .post("https://store1.gofile.io/contents/uploadfile")
+        .bearer_auth(&creds_toml.upload.api_token)
+        .multipart(form);
+
+    match req.send().await {
+        Ok(res) => println!("Response from remote: {}", res.text().await?),
+        Err(e) => println!("Error pushing data to remote: {}", e)
     }
 
     Ok(())
